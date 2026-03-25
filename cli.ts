@@ -8,6 +8,8 @@
  *   bun cli.ts status          — Show broker status and all peers
  *   bun cli.ts peers           — List all peers
  *   bun cli.ts send <id> <msg> — Send a message to a peer
+ *   bun cli.ts broadcast <msg> — Send a message to all peers
+ *   bun cli.ts logs [N]        — Show last N messages (default: 20)
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
@@ -129,6 +131,101 @@ switch (cmd) {
     break;
   }
 
+  case "broadcast": {
+    const msg = process.argv.slice(3).join(" ");
+    if (!msg) {
+      console.error("Usage: bun cli.ts broadcast <message>");
+      process.exit(1);
+    }
+    try {
+      const peers = await brokerFetch<
+        Array<{ id: string; pid: number; cwd: string; summary: string }>
+      >("/list-peers", {
+        scope: "machine",
+        cwd: "/",
+        git_root: null,
+      });
+
+      if (peers.length === 0) {
+        console.log("No peers registered. Message not sent.");
+        break;
+      }
+
+      let sent = 0;
+      let failed = 0;
+      for (const p of peers) {
+        try {
+          const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+            from_id: "cli",
+            to_id: p.id,
+            text: msg,
+          });
+          if (result.ok) {
+            sent++;
+          } else {
+            failed++;
+            console.error(`  Failed to send to ${p.id}: ${result.error}`);
+          }
+        } catch (e) {
+          failed++;
+          console.error(`  Error sending to ${p.id}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      console.log(`Broadcast complete: ${sent} sent, ${failed} failed (${peers.length} peers total)`);
+    } catch {
+      console.log("Broker is not running.");
+    }
+    break;
+  }
+
+  case "logs": {
+    const limit = parseInt(process.argv[3] ?? "20", 10);
+    const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+    try {
+      const { Database } = await import("bun:sqlite");
+      const db = new Database(DB_PATH, { readonly: true });
+      const rows = db
+        .query(
+          `SELECT id, from_id, to_id, text, sent_at, delivered
+           FROM messages
+           ORDER BY sent_at DESC
+           LIMIT ?`
+        )
+        .all(limit) as Array<{
+        id: number;
+        from_id: string;
+        to_id: string;
+        text: string;
+        sent_at: string;
+        delivered: number;
+      }>;
+      db.close();
+
+      if (rows.length === 0) {
+        console.log("No messages found.");
+        break;
+      }
+
+      // Display in chronological order (oldest first)
+      rows.reverse();
+      for (const r of rows) {
+        const status = r.delivered ? "delivered" : "pending";
+        const time = r.sent_at.replace("T", " ").replace(/\.\d+Z$/, "Z");
+        console.log(`[${time}] ${r.from_id} -> ${r.to_id} (${status})`);
+        console.log(`  ${r.text}`);
+        console.log();
+      }
+      console.log(`Showing ${rows.length} message(s).`);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === "SQLITE_CANTOPEN" || String(e).includes("unable to open")) {
+        console.log("No database found. Broker has not been started yet.");
+      } else {
+        console.error(`Error reading logs: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    break;
+  }
+
   case "kill-broker": {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
@@ -157,5 +254,7 @@ Usage:
   bun cli.ts status          Show broker status and all peers
   bun cli.ts peers           List all peers
   bun cli.ts send <id> <msg> Send a message to a peer
+  bun cli.ts broadcast <msg> Send a message to all peers
+  bun cli.ts logs [N]        Show last N messages (default: 20)
   bun cli.ts kill-broker     Stop the broker daemon`);
 }
